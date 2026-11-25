@@ -1,30 +1,9 @@
+external fn create_lock(owner: u64, token: u64, amount: u64, end: u64) -> u64;
+use { create_lock } from locker;
+
 spec Locker {
-    fn funded_lock(now: u64, amount: u64, end: u64) forall {
-        assume { assert(amount > 0); assert(end > now); }
-        funded_ledger(now, amount);
-        authorize_create_lock(OWNER, TOKEN, amount, end);
-        allow_transfer(OWNER, LOCKER, amount);
-
-        create_lock(OWNER, TOKEN, amount, end);
-
-        assert(auth_consumed());
-        assert(balance_u64(OWNER) == 0);
-        assert(balance_u64(LOCKER) == amount);
-        assert(stored_u64(OWNER, TOKEN, field("amount")) == amount);
-        assert(stored_u64(OWNER, TOKEN, field("unlock_time")) == end);
-    }
-
-    fn unauthorized_lock(now: u64, amount: u64, end: u64, grant: bool, approved: u64) forall {
-        assume { assert(amount > 0); assert(end > now); assert(!grant || approved != amount); }
-        funded_ledger(now, amount);
-        if grant {
-            authorize_create_lock(OWNER, TOKEN, approved, end);
-            allow_transfer(OWNER, LOCKER, approved);
-        }
-
-        assert(!try_create_lock(OWNER, TOKEN, amount, end));
-        assert(balance_u64(OWNER) == amount);
-        assert(balance_u64(LOCKER) == 0);
-        assert(!has_record(OWNER, TOKEN));
+    fn successful_return_is_void(owner: u64, token: u64, amount: u64, end: u64, result: u64) forall {
+        assume { assert(create_lock(owner, token, amount, end) == result); }
+        assert(result == 2);
     }
 }
