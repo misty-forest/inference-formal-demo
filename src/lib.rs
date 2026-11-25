@@ -23,7 +23,7 @@ impl Locker {
 
         token::Client::new(&env, &token).transfer(
             &owner,
-            &env.current_contract_address(),
+            env.current_contract_address(),
             &i128::from(amount),
         );
         let lock = Lock {
