@@ -1,0 +1,7 @@
+// Isolate static linking from the separate need for a proof-time ledger model.
+external fn create_lock(owner: u64, token: u64, amount: u64, end: u64) -> u64;
+use { create_lock } from locker;
+
+pub fn invoke(owner: u64, token: u64, amount: u64, end: u64) -> u64 {
+    return create_lock(owner, token, amount, end);
+}
