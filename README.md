@@ -1,6 +1,6 @@
-# Specify owner authorization on a Soroban Wasm contract
+# Prove owner authorization for a Soroban contract
 
-The [specification](proof/create_lock.inf) for the only [public Rust method](src/lib.rs) is:
+The public Rust method calls `owner.require_auth()`. The contract author writes one clause in [proof/create_lock.inf](proof/create_lock.inf) for the [existing Rust method](src/lib.rs).
 
 ```rust
 spec Locker {
@@ -8,57 +8,54 @@ spec Locker {
 }
 ```
 
-Run the [Inference compiler fork](https://github.com/misty-forest/inference/pull/3) against the [compiled contract](artifacts/locker.wasm):
+## Verify
+
+Install the pinned compiler and public WasmCert library in an opam environment with Coq 8.20.1. Run the check from this checkout.
 
 ```sh
-infc proof/create_lock.inf --mode proof --proof-subject artifacts/locker.wasm --out-dir target/proof
-coqc target/proof/create_lock.v
+cargo +1.98.0 install --git https://github.com/misty-forest/inference --rev b6976eade6d452391cb2c8d4a592ce66625165ba inference-cli
+opam pin add -y coq-wasm 'git+https://github.com/WasmCert/WasmCert-Coq.git#0fd83fa708922721132b6d6737179568d1f1d553'
+./verify.sh
 ```
 
-The compiler reads the parameter name and type from Soroban's XDR and matches the signature to the Wasm export. The contract author writes only the clause. There is no adapter, ledger fixture or hand-written Rocq file.
+The [script](verify.sh) runs `infc` on the spec and [the compiled contract](artifacts/locker.wasm), checks the generated proof with `coqc`, then runs `coqchk` on the compiled proof and its dependencies. The Wasm SHA-256 is `9f91b545f8bcdb1230263e2791f25b64f4a8445d6f44e0d96a3c6312b97f80b2`.
 
-## What is checked, and what remains open
+## What the theorem says
 
-| Generated statement | Evidence |
-| --- | --- |
-| `guard_1` | Rocq checks that the supported prefix of the actual export calls the Soroban auth import on the original owner. Branches that skip this call go to a trap. |
-| `obligation_1` | Every successful execution of this method requires acceptance of the original owner's authorization for this invocation. The proposition is generated and remains **open**. |
+Take any call to this Wasm export with its four arguments, any admissible deployed instance and host state. If the host refuses every successful `require_auth(owner)` for the original owner in this invocation, `create_lock` cannot return values. The theorem covers all amounts and unlock times. A call can still trap or diverge. It trusts Soroban to interpret a successful return from the bound auth import as authorization.
 
-The exact operational goal for the prover is:
+The compiler resolves the owner parameter by name from Soroban XDR. WasmCert links the export and the host import in the live store, enters the function with its ABI arguments, and follows the original owner through Wasm frames and branches. Fixing the ABI arity matters because Wasm allows additional operands below the callee's arguments on a caller's stack.
 
 ```coq
-Definition obligation_1 : Prop := requires_auth create_lock "create_lock"%string 0%nat.
-Goal obligation_1.
+Theorem obligation_1_proved : obligation_1.
+Proof. unfold obligation_1. AuthSound.prove_requires_auth. Qed.
 ```
 
-Slot zero is the original `owner` argument. The [definition of requires_auth](https://github.com/misty-forest/inference/blob/55bc86da21dd4ff33551b9d800978bf07acaa126/core/wasm-to-v/rocq/Authorization.v) uses WasmCert's actual module instantiation and execution relation. It quantifies over hosts, instances, arguments and stores. Remove only successful `require_auth(owner)` transitions in this guest invocation. The remaining executions must never return a value stack from the exported method. An authorization performed internally by another contract during a host-mediated token transfer is outside this invocation. The model trusts Soroban's interpretation of a successful return from the designated auth import.
+Inspect the theorem in the generated module:
 
-Rocq also proves that every execution under the restricted host is an execution of the original host (`preserves_execution`). The structural theorem `guard_1` is closed under the global context. The operational definitions use public WasmCert and its standard Coq library assumptions. The remaining work for a native prover is to prove this operational property and connect the resulting theorem to its specification-discharge mechanism. The generated file uses `Abort` for the open goal. A successful `coqc` run certifies `guard_1` only among the two contract claims.
+```sh
+(cd target/proof && echo 'Require Import create_lock. Print Assumptions obligation_1_proved.' | coqtop -quiet)
+```
 
-## Controls
+The proof inherits four Coq library assumptions and five WasmCert SIMD primitives. It introduces no project axioms. The generic theorem, its proof tactic, and the Wasm instruction shapes it handles live in the [compiler fork](https://github.com/misty-forest/inference/pull/3).
 
-| Input | Structural certificate |
+## Checks on the build
+
+| Spec or change | Kernel result |
 | --- | --- |
-| Original contract and `auth(owner)` | Accepted |
-| Same binary with `auth(token)` | Rejected |
+| `create_lock requires auth(owner)` on the included Wasm | Proved |
+| Request authorization of `token` instead | Rejected |
 | Rebuild without `owner.require_auth()` | Rejected |
 | Rebuild with `if amount != u64::MAX { owner.require_auth(); }` | Rejected |
 
-The structural tactic covers the instruction shapes needed for this example. It can reject a semantically equivalent optimization. The operational goal applies independently of that tactic.
-
-## Reproduce
-
-Use Coq 8.20.1, public WasmCert-Coq v2.2.0 and the pinned fork revision:
-
-```sh
-cargo +1.98.0 install --git https://github.com/misty-forest/inference --rev 55bc86da21dd4ff33551b9d800978bf07acaa126 inference-cli
-opam pin add -y coq-wasm 'git+https://github.com/WasmCert/WasmCert-Coq.git#0fd83fa708922721132b6d6737179568d1f1d553'
-```
-
-The included Wasm has SHA-256 `9f91b545f8bcdb1230263e2791f25b64f4a8445d6f44e0d96a3c6312b97f80b2`. To reproduce a source mutation, rebuild with the pinned Rust toolchain and Stellar CLI 27, then pass the changed Wasm to the same spec:
+To check a source change, build with the pinned Rust toolchain and Stellar CLI 27, then verify the new Wasm:
 
 ```sh
 stellar contract build --locked --optimize --out-dir target/contract
 infc proof/create_lock.inf --mode proof --proof-subject target/contract/inference_formal_demo.wasm --out-dir target/changed
 coqc target/changed/create_lock.v
 ```
+
+## Inference integration
+
+The native prover can consume the checked theorem for the same Wasm and clause and report that result in its verification pipeline. The public fork currently produces a stand-alone Rocq proof. Its tactic handles function-only imports and the supported guarded prefix. An unsupported program shape can cause proof search to fail even when a contract is safe.
