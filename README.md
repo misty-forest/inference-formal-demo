@@ -1,55 +1,64 @@
-# Checking a Soroban authorization guard with Inference
+# Specify owner authorization on a Soroban Wasm contract
 
-The [Rust contract](src/lib.rs) exports one method, `create_lock`. We want to catch a change that lets this method return without reaching `owner.require_auth()`. The [Inference fork](https://github.com/misty-forest/inference/pull/3) accepts the deployed-format Wasm and the name of the address to check.
+The [specification](proof/create_lock.inf) for the only [public Rust method](src/lib.rs) is:
 
-```sh
-infc artifacts/locker.wasm --soroban-auth create_lock:owner --out-dir target/proof
-coqc target/proof/OwnerAuth.v
+```rust
+spec Locker {
+    create_lock requires auth(owner);
+}
 ```
 
-The first command generates the entire Rocq file. The second checks the proof. The contract author supplies `create_lock:owner`. There is no Rust adapter, fixture, amount bound, or handwritten Rocq file.
+Run the [Inference compiler fork](https://github.com/misty-forest/inference/pull/3) against the [compiled contract](artifacts/locker.wasm):
 
-| Input to the same check | Rocq result |
+```sh
+infc proof/create_lock.inf --mode proof --proof-subject artifacts/locker.wasm --out-dir target/proof
+coqc target/proof/create_lock.v
+```
+
+The compiler reads the parameter name and type from Soroban's XDR and matches the signature to the Wasm export. The contract author writes only the clause. There is no adapter, ledger fixture or hand-written Rocq file.
+
+## What is checked, and what remains open
+
+| Generated statement | Evidence |
 | --- | --- |
-| Original contract, `create_lock:owner` | `Qed` |
-| Original contract, `create_lock:token` | Rejected |
-| Delete `owner.require_auth();` and rebuild | Rejected |
-| Wrap it in `if amount != u64::MAX { ... }` and rebuild | Rejected, even though the auth import is still present |
+| `guard_1` | Rocq checks that the supported prefix of the actual export calls the Soroban auth import on the original owner. Branches that skip this call go to a trap. |
+| `obligation_1` | Every successful execution of this method requires acceptance of the original owner's authorization for this invocation. The proposition is generated and remains **open**. |
 
-On public WasmCert v2.2.0 and Coq 8.20.1, `Print Assumptions owner_auth.` reported `Closed under the global context`. Each negative control failed at the theorem with `Cannot certify a direct call guard on the requested argument in this export`.
+The exact operational goal for the prover is:
 
-## What the proof says
+```coq
+Definition obligation_1 : Prop := requires_auth create_lock "create_lock"%string 0%nat.
+Goal obligation_1.
+```
 
-The compiler reads the `owner` argument position from `contractspecv0`. The theorem inspects the WasmCert representation of the actual export. It checks that the function loads the original argument and directly calls Soroban's `a.0` (`require_auth`) with it. In the certified prefix, a path that branches around that call leads to `unreachable`. A callee can trap or diverge before reaching the guard.
+Slot zero is the original `owner` argument. The [definition of requires_auth](https://github.com/misty-forest/inference/blob/55bc86da21dd4ff33551b9d800978bf07acaa126/core/wasm-to-v/rocq/Authorization.v) uses WasmCert's actual module instantiation and execution relation. It quantifies over hosts, instances, arguments and stores. Remove only successful `require_auth(owner)` transitions in this guest invocation. The remaining executions must never return a value stack from the exported method. An authorization performed internally by another contract during a host-mediated token transfer is outside this invocation. The model trusts Soroban's interpretation of a successful return from the designated auth import.
 
-This is a structural theorem about this binary. The tactic recognizes a limited set of instruction shapes and may reject a differently optimized contract with equivalent behavior. Proving that Soroban validates a grant for the correct invocation, or that a successful lock moves tokens and persists the right record, requires formal host semantics and a theorem about execution. Those properties remain open.
+Rocq also proves that every execution under the restricted host is an execution of the original host (`preserves_execution`). The structural theorem `guard_1` is closed under the global context. The operational definitions use public WasmCert and its standard Coq library assumptions. The remaining work for a native prover is to prove this operational property and connect the resulting theorem to its specification-discharge mechanism. The generated file uses `Abort` for the open goal. A successful `coqc` run certifies `guard_1` only among the two contract claims.
+
+## Controls
+
+| Input | Structural certificate |
+| --- | --- |
+| Original contract and `auth(owner)` | Accepted |
+| Same binary with `auth(token)` | Rejected |
+| Rebuild without `owner.require_auth()` | Rejected |
+| Rebuild with `if amount != u64::MAX { owner.require_auth(); }` | Rejected |
+
+The structural tactic covers the instruction shapes needed for this example. It can reject a semantically equivalent optimization. The operational goal applies independently of that tactic.
 
 ## Reproduce
 
-Build `infc` from the [compiler change](https://github.com/misty-forest/inference/pull/3). Use Coq 8.20.1 and public [WasmCert-Coq v2.2.0](https://github.com/WasmCert/WasmCert-Coq/tree/v2.2.0) in the active opam switch.
+Use Coq 8.20.1, public WasmCert-Coq v2.2.0 and the pinned fork revision:
 
 ```sh
-cargo +1.98.0 install --git https://github.com/misty-forest/inference --rev 176c982a9a5e902a8155d71515227c2ec494ce4f inference-cli
+cargo +1.98.0 install --git https://github.com/misty-forest/inference --rev 55bc86da21dd4ff33551b9d800978bf07acaa126 inference-cli
 opam pin add -y coq-wasm 'git+https://github.com/WasmCert/WasmCert-Coq.git#0fd83fa708922721132b6d6737179568d1f1d553'
 ```
 
-The commands at the top use the [included Wasm](artifacts/locker.wasm). Its SHA-256 is `9f91b545f8bcdb1230263e2791f25b64f4a8445d6f44e0d96a3c6312b97f80b2`. To try a source change, rebuild with the pinned Rust toolchain and Stellar CLI 27, then point `infc` at the new artifact.
+The included Wasm has SHA-256 `9f91b545f8bcdb1230263e2791f25b64f4a8445d6f44e0d96a3c6312b97f80b2`. To reproduce a source mutation, rebuild with the pinned Rust toolchain and Stellar CLI 27, then pass the changed Wasm to the same spec:
 
 ```sh
 stellar contract build --locked --optimize --out-dir target/contract
-infc target/contract/inference_formal_demo.wasm --soroban-auth create_lock:owner --out-dir target/changed
-coqc target/changed/OwnerAuth.v
+infc proof/create_lock.inf --mode proof --proof-subject target/contract/inference_formal_demo.wasm --out-dir target/changed
+coqc target/changed/create_lock.v
 ```
-
-## Native Inference specifications
-
-The [sidecar](proof/create_lock.inf) shows how a native universal Inference specification can reference the real export. It constrains a realized return to the Soroban ABI encoding of Void, `2`. The `external fn` declaration resolves to the implementation in `locker.wasm`. It uses the raw `i64` Wasm arguments, including encoded Soroban values.
-
-```sh
-infc proof/create_lock.inf --mode proof --proof-subject locker \
-  --wasm-dep locker=artifacts/locker.wasm --out-dir target/sidecar
-```
-
-This emits upstream's `ValidSpec` goal over the original Wasm with its host imports. The generated skeleton contains `Admitted`. Its return-value claim has **not** been discharged, and the implication alone does not establish that a lock can succeed. Inference documents the verifier implementation and discharger as private dependencies. [Upstream pin](https://github.com/Inferara/inference/blob/be016fc05d2b8a1ff4377dd3a90dc148f99f3694/core/wasm-to-v/wasm-verifier-pin.txt)
-
-The earlier [standalone Z3 experiment](https://github.com/misty-forest/inference-formal-demo/tree/03bc879e1549275cb91c927b6b2b2564e754ddd0) is preserved at its original revision.

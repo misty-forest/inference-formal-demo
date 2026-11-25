@@ -1,9 +1,3 @@
-external fn create_lock(owner: u64, token: u64, amount: u64, end: u64) -> u64;
-use { create_lock } from locker;
-
 spec Locker {
-    fn successful_return_is_void(owner: u64, token: u64, amount: u64, end: u64, result: u64) forall {
-        assume { assert(create_lock(owner, token, amount, end) == result); }
-        assert(result == 2);
-    }
+    create_lock requires auth(owner);
 }
