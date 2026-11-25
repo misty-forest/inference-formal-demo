@@ -1,59 +1,67 @@
 # Proving a Soroban lock with Inference
 
-Can we prove what a public Rust/Soroban method does to custody and authorization by giving Inference the ordinary contract Wasm and a short specification?
+[The Rust contract](src/lib.rs) has one public method, `create_lock(owner, token, amount, unlock_time)`. It requires owner authorization, transfers tokens into custody and stores the amount and deadline. The [specification](proof/create_lock.inf) runs against the [compiled contract](artifacts/locker.wasm) using a [symbolic backend in the Inference fork](https://github.com/misty-forest/inference/tree/1743fc54be6e0dad854d42c290f8f2aa9d0154c0/contrib/soroban-proof).
 
-[The contract](src/lib.rs) has one public method, `create_lock(owner, token, amount, unlock_time)`. The owner authorizes the call. The method checks the amount and deadline, transfers the tokens to the contract and stores a lock under the owner/token pair. This example exists only to discuss verification and has no withdrawal method.
+[Implementation PR in the Inference fork](https://github.com/misty-forest/inference/pull/2).
 
-**Current result with infc 0.0.6.** The [Inference specification](proof/create_lock.inf) parses and type-checks. The backend stops before emitting a Rocq obligation for either property. Both commands below reproduce a missing capability.
+The contract author writes the initial conditions, the permitted invocations and the assertions. For example, these are the actual postconditions after a successful call:
 
-## What the prover should establish
+```rust
+assert(auth_consumed());
+assert(balance_u64(OWNER) == 0);
+assert(balance_u64(LOCKER) == amount);
+assert(stored_u64(OWNER, TOKEN, field("amount")) == amount);
+assert(stored_u64(OWNER, TOKEN, field("unlock_time")) == end);
+```
 
-For every `u64` amount, ledger timestamp and unlock time with `amount > 0` and `unlock_time > now`, start with distinct owner and locker addresses, a standard Stellar Asset Contract, owner balance equal to the symbolic amount, locker balance zero and no existing lock. Assume a valid ledger, live entries and sufficient execution resources.
+## Run the proof
 
-| Owner's authorization | Required outcome |
+Install [infc 0.0.6](https://github.com/Inferara/inference/releases/tag/v0.0.6), Stellar CLI 27, WABT (`wasm2wat`) and Python 3.10 or later. From this repository's root:
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install 'git+https://github.com/misty-forest/inference.git@1743fc54be6e0dad854d42c290f8f2aa9d0154c0#subdirectory=contrib/soroban-proof'
+infs-soroban-prove artifacts/locker.wasm proof/create_lock.inf
+```
+
+Observed output:
+
+```text
+PROVED funded_lock (9 admitted symbolic paths)
+PROVED unauthorized_lock (8 admitted symbolic paths)
+```
+
+The fork compiles the scenarios with `infc` and symbolically executes the resulting instructions together with the supplied contract Wasm. Z3 considers every feasible branch under the preconditions. The numbers count branches through the programs. Each can represent many input values.
+
+## What is proved
+
+For every positive `u64` amount and all `u64` timestamps with `end > now`, start with distinct owner, token and locker identities. The owner holds exactly the requested amount, the locker holds zero and its storage is empty.
+
+| Authorization | Required outcome |
 | --- | --- |
-| Exact call and its nested token transfer | The invocation succeeds and consumes that authorization tree. The owner ends with zero, the locker receives the entire amount, and the stored record contains exactly the supplied amount and deadline. |
-| No grant, or a grant for any different `u64` amount | The invocation fails, both balances retain their initial values and the lock remains absent. |
+| Exact root call and nested transfer | The call succeeds, consumes both grant nodes, moves exactly the requested amount and writes the matching amount and time under the owner/token key. |
+| No grant, or a grant for any different amount | The call fails. Both balances retain their initial values and the persistent key remains absent. |
 
-The success property also requires the call to complete. An implementation that rejects every invocation would violate it. The funding assumption scopes the claim to a fresh, fully funded owner. There is no table of example amounts.
+This is a solver-backed proof under a handwritten model of the relevant protocol 29 host calls, one standard asset and transaction rollback. It assumes valid credentials for installed grants, live entries and sufficient execution resources. Signature cryptography, arbitrary token code and pre-existing positions are outside the claim. The model and the Wasm interpreter are trusted prototype code. This backend emits a solver result, without a Rocq certificate.
 
-## Reproduce with the stock compiler
+## Where the functions come from
 
-From this repository's root, with [infc 0.0.6](https://github.com/Inferara/inference/releases/tag/v0.0.6) on PATH, use the included [compiled contract](artifacts/locker.wasm).
+The fork reads `contractspecv0` and generates bindings for `create_lock`, `try_create_lock` and `authorize_create_lock`. The first two invoke the contract's actual export. The third describes the permitted invocation.
 
-**1. Submit the universal properties.**
+`balance_u64` reads the signed 128-bit balance in the model and checks that it fits in u64. The implemented Soroban `transfer` host call updates the same balance. `stored_u64` reads the map written by the contract's actual storage call, including the field names decoded from Wasm memory. Both observers are supplied by the fork. There are no handwritten contract adapters or external declarations in the spec. [Host implementation](https://github.com/misty-forest/inference/blob/1743fc54be6e0dad854d42c290f8f2aa9d0154c0/contrib/soroban-proof/soroban_proof/ledger.py)
 
-```sh
-infc proof/create_lock.inf --mode proof \
-  --wasm-dep locker=artifacts/locker.wasm --out-dir target/proof
-```
+## Try to falsify it
 
-Observed diagnostic: `Host imports are not yet modeled in the proof translation.` The `host::soroban` declarations in the spec describe a **proposed proof interface**. They have no mock implementation. Each balance or lock observer must read the actual modeled state after the call. The exact-grant observer must compare the consumed authorization trace with the installed grant. The fallible binding must dispatch the same Wasm export and expose failure after transaction rollback.
-
-**2. Isolate the linker without any proof-host declarations.**
-
-```sh
-infc repro/link_only.inf --mode proof \
-  --wasm-dep locker=artifacts/locker.wasm --out-dir target/link
-```
-
-Observed diagnostic: ``merged function transitively imports `a::0`, which has no body to merge``. This is the contract's call to [Soroban require_auth](https://docs.rs/crate/soroban-env-common/29.0.1/source/env.json). The probe only forwards the four raw ABI words to the actual export. This isolates the linking issue from ledger setup and assertions.
-
-## What would make this usable
-
-1. **Generate typed bindings from the embedded contract spec.** The author should write a call using addresses and the full `u64` domain. Binding generation can handle tagged `Val` words, host objects and the encoded void result. Token balances use signed 128-bit amounts.
-2. **Supply a proof-time Soroban ledger.** A symbolic funded state, the ledger clock, persistent storage and a standard token model would let the verifier derive the state transition of the linked contract. The contract can rely on the standard asset's specified transfer semantics. State this dependency as a proof assumption.
-3. **Expose the invocation result and authorization trace.** The author needs to express who must authorize which arguments and nested calls, then observe success, failure and rolled-back state. A missing proof model should identify the unresolved host operation.
-
-A useful acceptance check would be to discharge both properties on these contract bytes, then show a counterexample when the contract records the wrong amount. Today the Rust contract builds and both proof attempts stop at the diagnostics above.
-
-## Rebuild the Wasm
-
-Use Rust 1.96.0, the `wasm32v1-none` target, and Stellar CLI 27.0.0 with optimization support.
+In `src/lib.rs`, change the stored amount to `amount: if amount == u64::MAX { 0 } else { amount }`. Keep the token transfer and the spec unchanged. With Rust 1.96.0 and the `wasm32v1-none` target, rebuild and check the changed artifact:
 
 ```sh
 stellar contract build --locked --optimize --out-dir target/contract
-cmp artifacts/locker.wasm target/contract/inference_formal_demo.wasm
+infs-soroban-prove target/contract/inference_formal_demo.wasm proof/create_lock.inf
 ```
 
-The reference build exports one contract method, `create_lock`. The committed artifact is 1,477 bytes. Its SHA-256 is `9f91b545f8bcdb1230263e2791f25b64f4a8445d6f44e0d96a3c6312b97f80b2`.
+The verifier exits 1 and reports a counterexample with `amount = 18446744073709551615`, at the assertion on the stored amount. Replaying that input on an independent local Soroban SDK host confirmed that the locker received the full amount and stored zero.
+
+The original optimized Wasm is 1,477 bytes, SHA-256 `9f91b545f8bcdb1230263e2791f25b64f4a8445d6f44e0d96a3c6312b97f80b2`. With the original source, the build command above reproduces it.
+
+The [stock linker reproducer](repro/link_only.inf) remains available to compare the fork with upstream. Stock `infc 0.0.6` invoked as `infc repro/link_only.inf --mode proof --wasm-dep locker=artifacts/locker.wasm --out-dir target/link` stops at Soroban's `a::0` (`require_auth`).

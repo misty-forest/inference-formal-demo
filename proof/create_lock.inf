@@ -1,57 +1,30 @@
-// The linked entry uses the Soroban Val ABI. The proof-host interface below
-// describes the environment needed by this obligation (see README).
-external fn create_lock(owner: u64, token: u64, amount: u64, end: u64) -> u64;
-use { create_lock } from locker;
-
-external fn fresh_funded_ledger(now: u64, amount: u64);
-external fn grant_owner_lock(amount: u64, end: u64);
-external fn owner_address() -> u64;
-external fn token_address() -> u64;
-external fn u64_val(value: u64) -> u64;
-external fn owner_balance_equals(value: u64) -> bool;
-external fn locker_balance_equals(value: u64) -> bool;
-external fn stored_lock_equals(amount: u64, end: u64) -> bool;
-external fn used_exact_grant() -> bool;
-external fn lock_is_absent() -> bool;
-// A trapping call rolls back before returning false. This binding must
-// dispatch the same Wasm export as the direct call above.
-external fn try_create_lock(owner: u64, token: u64, amount: u64, end: u64) -> bool;
-use { fresh_funded_ledger, grant_owner_lock, try_create_lock, lock_is_absent, used_exact_grant, owner_address, token_address, u64_val,
-      owner_balance_equals, locker_balance_equals, stored_lock_equals } from host::soroban;
-
-fn creates_funded_lock(now: u64, amount: u64, end: u64) -> bool {
-    fresh_funded_ledger(now, amount);
-    grant_owner_lock(amount, end);
-    let result: u64 = create_lock(owner_address(), token_address(), u64_val(amount), u64_val(end));
-    const SOROBAN_VOID: u64 = 2;
-    return result == SOROBAN_VOID && used_exact_grant() && owner_balance_equals(0)
-           && locker_balance_equals(amount) && stored_lock_equals(amount, end);
-}
-
-fn rejects_unapproved_lock(now: u64, amount: u64, end: u64, grant: bool, approved: u64) -> bool {
-    fresh_funded_ledger(now, amount);
-    if grant {
-        grant_owner_lock(approved, end);
-    }
-    let ok: bool = try_create_lock(owner_address(), token_address(), u64_val(amount), u64_val(end));
-    return !ok && owner_balance_equals(amount) && locker_balance_equals(0) && lock_is_absent();
-}
-
 spec Locker {
-    fn funded_create_preserves_custody(now: u64, amount: u64, end: u64) forall {
-        assume {
-            assert(amount > 0);
-            assert(end > now);
-        }
-        assert(creates_funded_lock(now, amount, end));
+    fn funded_lock(now: u64, amount: u64, end: u64) forall {
+        assume { assert(amount > 0); assert(end > now); }
+        funded_ledger(now, amount);
+        authorize_create_lock(OWNER, TOKEN, amount, end);
+        allow_transfer(OWNER, LOCKER, amount);
+
+        create_lock(OWNER, TOKEN, amount, end);
+
+        assert(auth_consumed());
+        assert(balance_u64(OWNER) == 0);
+        assert(balance_u64(LOCKER) == amount);
+        assert(stored_u64(OWNER, TOKEN, field("amount")) == amount);
+        assert(stored_u64(OWNER, TOKEN, field("unlock_time")) == end);
     }
 
-    fn missing_or_mismatched_permission(now: u64, amount: u64, end: u64, grant: bool, approved: u64) forall {
-        assume {
-            assert(amount > 0);
-            assert(end > now);
-            assert(!grant || approved != amount);
+    fn unauthorized_lock(now: u64, amount: u64, end: u64, grant: bool, approved: u64) forall {
+        assume { assert(amount > 0); assert(end > now); assert(!grant || approved != amount); }
+        funded_ledger(now, amount);
+        if grant {
+            authorize_create_lock(OWNER, TOKEN, approved, end);
+            allow_transfer(OWNER, LOCKER, approved);
         }
-        assert(rejects_unapproved_lock(now, amount, end, grant, approved));
+
+        assert(!try_create_lock(OWNER, TOKEN, amount, end));
+        assert(balance_u64(OWNER) == amount);
+        assert(balance_u64(LOCKER) == 0);
+        assert(!has_record(OWNER, TOKEN));
     }
 }
