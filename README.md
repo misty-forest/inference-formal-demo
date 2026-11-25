@@ -16,6 +16,8 @@ The first command generates the entire Rocq file. The second checks the proof. T
 | Delete `owner.require_auth();` and rebuild | Rejected |
 | Wrap it in `if amount != u64::MAX { ... }` and rebuild | Rejected, even though the auth import is still present |
 
+On public WasmCert v2.2.0 and Coq 8.20.1, `Print Assumptions owner_auth.` reported `Closed under the global context`. Each negative control failed at the theorem with `Cannot certify a direct call guard on the requested argument in this export`.
+
 ## What the proof says
 
 The compiler reads the `owner` argument position from `contractspecv0`. The theorem inspects the WasmCert representation of the actual export. It checks that the function loads the original argument and directly calls Soroban's `a.0` (`require_auth`) with it. In the certified prefix, a path that branches around that call leads to `unreachable`. A callee can trap or diverge before reaching the guard.
@@ -27,7 +29,7 @@ This is a structural theorem about this binary. The tactic recognizes a limited 
 Build `infc` from the [compiler change](https://github.com/misty-forest/inference/pull/3). Use Coq 8.20.1 and public [WasmCert-Coq v2.2.0](https://github.com/WasmCert/WasmCert-Coq/tree/v2.2.0) in the active opam switch.
 
 ```sh
-cargo +1.98.0 install --git https://github.com/misty-forest/inference --rev e427195b2df1f5541bdd744a2ce684b30b89ee14 inference-cli
+cargo +1.98.0 install --git https://github.com/misty-forest/inference --rev 176c982a9a5e902a8155d71515227c2ec494ce4f inference-cli
 opam pin add -y coq-wasm 'git+https://github.com/WasmCert/WasmCert-Coq.git#0fd83fa708922721132b6d6737179568d1f1d553'
 ```
 
