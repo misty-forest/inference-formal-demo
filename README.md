@@ -1,67 +1,145 @@
-# Proving a Soroban lock with Inference
+# Inference specifications for the ICE Locker
 
-[The Rust contract](src/lib.rs) has one public method, `create_lock(owner, token, amount, unlock_time)`. It requires owner authorization, transfers tokens into custody and stores the amount and deadline. The [specification](proof/create_lock.inf) runs against the [compiled contract](artifacts/locker.wasm) using a [symbolic backend in the Inference fork](https://github.com/misty-forest/inference/tree/1743fc54be6e0dad854d42c290f8f2aa9d0154c0/contrib/soroban-proof).
+## Voting-power math in Inference
 
-[Implementation PR in the Inference fork](https://github.com/misty-forest/inference/pull/2).
+The [checkpoint model](repro/ice/math/model/checkpoints.inf) and [Locker bucket specification](repro/ice/math/locker/bucket.inf) contain eight native `forall` claims. **Their proof status is open.** The public compiler generates `ValidSpec` goals ending in `Admitted`. Running the generator or compiling its output does not discharge those goals.
 
-The contract author writes the initial conditions, the permitted invocations and the assertions. For example, these are the actual postconditions after a successful call:
+| Property from the earlier portfolio proof | What the Inference source expresses | Implementation under the claim |
+| --- | --- | --- |
+| Exact decay over an interval, including the boost plateau and expiry | Lost bonus seconds equal the overlap with the last 156 weeks. Splitting an interval at any intermediate time preserves that overlap. | Executable arithmetic model in `.inf` |
+| Same-week shortcut | For any week-aligned expiry and two timestamps in one week, a bucket decays for the entire interval or for zero seconds, as determined at the start. | Same model |
+| Checkpoint rounding | For any valid initial whole/remainder pair, two affordable normalized debits produce the same pair as a single combined debit. The remainder stays below the horizon. | Same model, with arbitrary loss and carry values |
+| Exact live bucket numerator | For every `u64` amount and ordered timestamp pair, both words equal the product of the amount and the capped multiplier. Splitting the principal at any amount preserves the full result, including the carry. At the Locker cap the whole portion fits in `u64`. | Mainnet Locker's compiled bucket function in a verification-only Wasm copy |
 
-```rust
-assert(auth_consumed());
-assert(balance_u64(OWNER) == 0);
-assert(balance_u64(LOCKER) == amount);
-assert(stored_u64(OWNER, TOKEN, field("amount")) == amount);
-assert(stored_u64(OWNER, TOKEN, field("unlock_time")) == end);
-```
+The previous theorem quantified over a complete portfolio and an arbitrary-length checkpoint history. The new local composition laws capture a step one would use in an induction proof. The full history theorem, validity of stored head state, and equivalence of the public `total_supply` method to a full reprice remain open. The model covers ordinary locks with fixed principal. In a concrete run of the stock-compiled model, a one-unit lock just entering decay kept whole power 9 after two one-second steps. Dropping the first remainder gave 8.
 
-## Run the proof
+### Reproduce the compiler output
 
-Install [infc 0.0.6](https://github.com/Inferara/inference/releases/tag/v0.0.6), Stellar CLI 27, WABT (`wasm2wat`) and Python 3.10 or later. From this repository's root:
+With the pinned `infc` below, Stellar CLI, and `wasm-tools` (tested with 1.244.0), run:
 
 ```sh
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install 'git+https://github.com/misty-forest/inference.git@1743fc54be6e0dad854d42c290f8f2aa9d0154c0#subdirectory=contrib/soroban-proof'
-infs-soroban-prove artifacts/locker.wasm proof/create_lock.inf
+./repro/ice/math/generate.sh
 ```
 
-Observed output:
+An optional argument supplies the original Wasm for offline use. The script checks the Mainnet SHA-256 and writes the verification copy and the generated goals into `target/ice-math/`. For the checkpoint model alone, stock Inference needs just:
 
-```text
-PROVED funded_lock (9 admitted symbolic paths)
-PROVED unauthorized_lock (8 admitted symbolic paths)
+```sh
+infc repro/ice/math/model/checkpoints.inf --mode proof -v --out-dir target/model
 ```
 
-The fork compiles the scenarios with `infc` and symbolically executes the resulting instructions together with the supplied contract Wasm. Z3 considers every feasible branch under the preconditions. The numbers count branches through the programs. Each can represent many input values.
+### What worked on the stock compiler
 
-## What is proved
+We ran upstream [`be016fc`](https://github.com/Inferara/inference/commit/be016fc05d2b8a1ff4377dd3a90dc148f99f3694) and the pinned fork on the model. They emitted byte-identical obligations. A stock spec quantifying an array with 64 scalar leaves compiled. With 65 leaves it failed with `P013`. Passing the Locker's 336 independently quantified amounts to a loop also failed at this limit. A scalar `u128` parameter failed type checking.
 
-For every positive `u64` amount and all `u64` timestamps with `end > now`, start with distinct owner, token and locker identities. The owner holds exactly the requested amount, the locker holds zero and its storage is empty.
+The compiled bucket is internal function 156 of the pinned Locker. It takes a result pointer and writes two words. The script adds two scalar getters to a local copy so Inference can name each word. In the checked build all 361 original function bodies stayed byte-identical. The stock linker rejected this linked Soroban module because it owns static data. The fork's `--proof-subject` option generated three native obligations over the copy. The original module has neither getter export.
 
-| Authorization | Required outcome |
+The next integration test for the Inference team is to run these two generated modules with their [native discharger](https://github.com/Inferara/inference/blob/be016fc05d2b8a1ff4377dd3a90dc148f99f3694/core/wasm-to-v/ROCQ_CONTRACT.md). Useful product improvements for ICE would be a native unsigned 128-bit value, bindings for internal Rust arithmetic, and a way to specify an aggregate invariant and carry it over a history of contract calls.
+
+## Authorization example
+
+The public Rust method calls `owner.require_auth()`. The contract author writes one clause in [proof/create_lock.inf](proof/create_lock.inf) for the [existing Rust method](src/lib.rs).
+
+```rust
+spec Locker {
+    create_lock requires auth(owner);
+}
+```
+
+## Verify
+
+Install the pinned compiler and public WasmCert library in an opam environment with Coq 8.20.1. Run the check from this checkout.
+
+```sh
+cargo +1.98.0 install --git https://github.com/misty-forest/inference --rev 07e23ef6233775c2f51634c9ba42943ac5292f23 inference-cli
+opam pin add -y coq-wasm 'git+https://github.com/WasmCert/WasmCert-Coq.git#0fd83fa708922721132b6d6737179568d1f1d553'
+./verify.sh
+```
+
+The [script](verify.sh) runs `infc` on the spec and [the compiled contract](artifacts/locker.wasm), checks the generated proof with `coqc`, then runs `coqchk` on the compiled proof and its dependencies. The Wasm SHA-256 is `9f91b545f8bcdb1230263e2791f25b64f4a8445d6f44e0d96a3c6312b97f80b2`.
+
+## Verify two exports of the ICE Locker on Mainnet
+
+The [ICE specification](repro/ice/shelves.inf) is the entire input written for these two methods.
+
+```rust
+spec Locker {
+    commit_shelf requires auth(owner);
+    rearm_shelf requires auth(owner);
+}
+```
+
+With Stellar CLI installed, run the same compiler and public kernel on the deployed Wasm.
+
+```sh
+./repro/ice/verify.sh
+```
+
+The script fetches the contract code by hash, checks its SHA-256, and verifies both theorems in one generated module. For an offline run, pass a local copy of the same Wasm as the script's argument. The expected hash is `34b68322200c48b70645b06af1e49ac8d7137eea8d60c8b01345da5b30d411c8`.
+
+In this build both exports forward the owner and the position ID to one internal function. A third argument distinguishes the two operations. The proof resolves the helper in the instantiated module, tracks the original owner into the helper's parameter, and checks its call to the Soroban auth import. The two generated theorems are `obligation_1_proved` and `obligation_2_proved`.
+
+### What happens with two internal calls?
+
+| Wasm supplied to the same rule | Internal calls before the auth import | Result |
+| --- | ---: | --- |
+| Mainnet Locker, `commit_shelf` and `rearm_shelf` | 1 | Both owner clauses proved |
+| Compiler regression fixture, owner changes parameter position at each call | 2 | Proved. Swapping the operands passed to the last function makes the proof fail |
+| Local rebuild of the unchanged ICE Locker, `commit_shelf` | 2 | Could not prove the owner clause |
+
+From an ICE checkout at `ffbb3346c0c5fa1d2759f934442787ab3da833ab`, we built the local artifact with Rust 1.96.0 and Stellar CLI 27.0.0.
+
+```sh
+CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_OPT_LEVEL=z \
+    stellar contract build --locked --package soroban-token-timelock-contract --out-dir target/local-ice
+```
+
+Its Wasm SHA-256 is `d241824b0b4d8734786d2ac41acadd6a2ef09de57fa45fa9a9a76c877aa7dc68`. In that binary `commit_shelf` (254) calls 511, which calls 425, which loads the address from linear memory and calls the auth import (5). Checking this build requires tracking the original owner through stores, an intervening helper call, and loads. The current certificate tracks locals and numeric operands. The tactic cannot construct the certificate for this body. The compiler regression is in [the fork’s CLI tests](https://github.com/misty-forest/inference/blob/07e23ef6233775c2f51634c9ba42943ac5292f23/core/cli/tests/proof_subject.rs#L137).
+
+With that local Wasm, use the same spec directly. The Mainnet script above pins the deployed artifact.
+
+```sh
+infc repro/ice/shelves.inf --mode proof --proof-subject "$LOCKER_WASM" --out-dir target/local-ice
+coqc target/local-ice/shelves.v
+```
+
+## What the theorem says
+
+Take any call to this Wasm export with its four arguments, any admissible deployed instance and host state. If the host refuses every successful `require_auth(owner)` for the original owner in this invocation, `create_lock` cannot return values. The theorem covers all amounts and unlock times. A call can still trap or diverge. It trusts Soroban to interpret a successful return from the bound auth import as authorization.
+
+An ordinary auth test can check the owner and invocation tree for one successful lock. The proof also covers amounts the test never tried, including `u64::MAX`. A method that always traps would satisfy this theorem. Keep the successful-lock test for token balances, stored state, and the actual Soroban auth tree.
+
+The compiler resolves the owner parameter by name from Soroban XDR. WasmCert links the export and the host import in the live store, enters the function with its ABI arguments, and follows the original owner through Wasm frames and branches. Fixing the ABI arity matters because Wasm allows additional operands below the callee's arguments on a caller's stack.
+
+```coq
+Theorem obligation_1_proved : obligation_1.
+Proof. exact (AuthCertificate.sound _ _ _ guard_1). Qed.
+```
+
+Inspect the theorem in the generated module:
+
+```sh
+(cd target/proof && echo 'Require Import create_lock. Print Assumptions obligation_1_proved.' | coqtop -quiet)
+```
+
+The proof inherits four Coq library assumptions and five WasmCert SIMD primitives. It introduces no project axioms. The generic theorem, its proof tactic, and the Wasm instruction shapes it handles live in the [compiler fork](https://github.com/misty-forest/inference/pull/3).
+
+## Checks on the build
+
+| Spec or change | Kernel result |
 | --- | --- |
-| Exact root call and nested transfer | The call succeeds, consumes both grant nodes, moves exactly the requested amount and writes the matching amount and time under the owner/token key. |
-| No grant, or a grant for any different amount | The call fails. Both balances retain their initial values and the persistent key remains absent. |
+| `create_lock requires auth(owner)` on the included Wasm | Proved |
+| Request authorization of `token` instead | Rejected |
+| Rebuild without `owner.require_auth()` | Rejected |
+| Rebuild with `if amount != u64::MAX { owner.require_auth(); }` | Rejected |
 
-This is a solver-backed proof under a handwritten model of the relevant protocol 29 host calls, one standard asset and transaction rollback. It assumes valid credentials for installed grants, live entries and sufficient execution resources. Signature cryptography, arbitrary token code and pre-existing positions are outside the claim. The model and the Wasm interpreter are trusted prototype code. This backend emits a solver result, without a Rocq certificate.
-
-## Where the functions come from
-
-The fork reads `contractspecv0` and generates bindings for `create_lock`, `try_create_lock` and `authorize_create_lock`. The first two invoke the contract's actual export. The third describes the permitted invocation.
-
-`balance_u64` reads the signed 128-bit balance in the model and checks that it fits in u64. The implemented Soroban `transfer` host call updates the same balance. `stored_u64` reads the map written by the contract's actual storage call, including the field names decoded from Wasm memory. Both observers are supplied by the fork. There are no handwritten contract adapters or external declarations in the spec. [Host implementation](https://github.com/misty-forest/inference/blob/1743fc54be6e0dad854d42c290f8f2aa9d0154c0/contrib/soroban-proof/soroban_proof/ledger.py)
-
-## Try to falsify it
-
-In `src/lib.rs`, change the stored amount to `amount: if amount == u64::MAX { 0 } else { amount }`. Keep the token transfer and the spec unchanged. With Rust 1.96.0 and the `wasm32v1-none` target, rebuild and check the changed artifact:
+To check a source change, build with the pinned Rust toolchain and Stellar CLI 27, then verify the new Wasm:
 
 ```sh
 stellar contract build --locked --optimize --out-dir target/contract
-infs-soroban-prove target/contract/inference_formal_demo.wasm proof/create_lock.inf
+infc proof/create_lock.inf --mode proof --proof-subject target/contract/inference_formal_demo.wasm --out-dir target/changed
+coqc target/changed/create_lock.v
 ```
 
-The verifier exits 1 and reports a counterexample with `amount = 18446744073709551615`, at the assertion on the stored amount. Replaying that input on an independent local Soroban SDK host confirmed that the locker received the full amount and stored zero.
+## Inference integration
 
-The original optimized Wasm is 1,477 bytes, SHA-256 `9f91b545f8bcdb1230263e2791f25b64f4a8445d6f44e0d96a3c6312b97f80b2`. With the original source, the build command above reproduces it.
-
-The [stock linker reproducer](repro/link_only.inf) remains available to compare the fork with upstream. Stock `infc 0.0.6` invoked as `infc repro/link_only.inf --mode proof --wasm-dep locker=artifacts/locker.wasm --out-dir target/link` stops at Soroban's `a::0` (`require_auth`).
+The native prover can consume the checked theorem for the same Wasm and clause and report that result in its verification pipeline. The public fork currently produces a stand-alone Rocq proof. Its tactic handles function-only imports, a supported guarded prefix, and finite chains of internal forwarding calls that pass locals or numeric constants. An unsupported program shape can cause proof search to fail even when a contract is safe.

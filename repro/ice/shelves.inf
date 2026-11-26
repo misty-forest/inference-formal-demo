@@ -1,0 +1,4 @@
+spec Locker {
+    commit_shelf requires auth(owner);
+    rearm_shelf requires auth(owner);
+}

@@ -1,0 +1,84 @@
+// Ordinary locks. Expired principal keeps its base power.
+const HORIZON: u64 = 94348800;
+const WEEK: u64 = 604800;
+const OFFSET: u64 = 345600;
+
+fn bonus_seconds(expiry: u64, now: u64) -> u64 {
+    if now >= expiry { return 0; }
+    let left: u64 = expiry - now;
+    if left > HORIZON { return HORIZON; }
+    return left;
+}
+
+// Intersection of the observation interval with the final 156 weeks.
+fn decaying_seconds(expiry: u64, start: u64, stop: u64) -> u64 {
+    let mut first: u64 = start;
+    if expiry > HORIZON {
+        let threshold: u64 = expiry - HORIZON;
+        if threshold > first { first = threshold; }
+    }
+    let mut last: u64 = stop;
+    if expiry < last { last = expiry; }
+    if first >= last { return 0; }
+    return last - first;
+}
+
+fn remaining_whole(whole: u64, rem: u64, loss_whole: u64, loss_rem: u64) -> u64 {
+    if rem < loss_rem { return whole - loss_whole - 1; }
+    return whole - loss_whole;
+}
+
+fn remaining_rem(rem: u64, loss_rem: u64) -> u64 {
+    if rem < loss_rem { return rem + HORIZON - loss_rem; }
+    return rem - loss_rem;
+}
+
+spec Checkpoints {
+    fn exact_bonus_loss(expiry: u64, start: u64, stop: u64) forall {
+        assume { assert(start <= stop); }
+        assert(bonus_seconds(expiry, start) - bonus_seconds(expiry, stop)
+               == decaying_seconds(expiry, start, stop));
+    }
+
+    fn splitting_time_preserves_decay(expiry: u64, start: u64, mid: u64, stop: u64) forall {
+        assume { assert(start <= mid && mid <= stop); }
+        assert(decaying_seconds(expiry, start, stop)
+               == decaying_seconds(expiry, start, mid) + decaying_seconds(expiry, mid, stop));
+    }
+
+    fn within_one_week(expiry: u64, start: u64, stop: u64) forall {
+        assume {
+            assert(OFFSET <= expiry && OFFSET <= start && start <= stop);
+            assert((expiry - OFFSET) % WEEK == 0);
+            assert((start - OFFSET) / WEEK == (stop - OFFSET) / WEEK);
+        }
+        if start < expiry && expiry - start <= HORIZON {
+            assert(decaying_seconds(expiry, start, stop) == stop - start);
+        } else {
+            assert(decaying_seconds(expiry, start, stop) == 0);
+        }
+    }
+
+    fn remainder_stays_canonical(rem: u64, loss_rem: u64) forall {
+        assume { assert(rem < HORIZON && loss_rem < HORIZON); }
+        assert(remaining_rem(rem, loss_rem) < HORIZON);
+    }
+
+    // A loss is stored as whole units and a remainder modulo HORIZON.
+    fn two_debits_equal_one(whole: u64, rem: u64, q1: u64, r1: u64, q2: u64, r2: u64) forall {
+        assume {
+            assert(rem < HORIZON && r1 < HORIZON && r2 < HORIZON);
+            assert(q1 <= whole && q2 <= whole - q1);
+        }
+        let carry: u64 = (r1 + r2) / HORIZON;
+        let final_rem_loss: u64 = (r1 + r2) % HORIZON;
+        let available: u64 = whole - q1 - q2;
+        assume { assert(available > carry || (available == carry && rem >= final_rem_loss)); }
+
+        let mid_whole: u64 = remaining_whole(whole, rem, q1, r1);
+        let mid_rem: u64 = remaining_rem(rem, r1);
+        assert(remaining_whole(mid_whole, mid_rem, q2, r2)
+               == remaining_whole(whole, rem, q1 + q2 + carry, final_rem_loss));
+        assert(remaining_rem(mid_rem, r2) == remaining_rem(rem, final_rem_loss));
+    }
+}
