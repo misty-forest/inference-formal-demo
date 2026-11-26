@@ -13,12 +13,33 @@ spec Locker {
 Install the pinned compiler and public WasmCert library in an opam environment with Coq 8.20.1. Run the check from this checkout.
 
 ```sh
-cargo +1.98.0 install --git https://github.com/misty-forest/inference --rev b6976eade6d452391cb2c8d4a592ce66625165ba inference-cli
+cargo +1.98.0 install --git https://github.com/misty-forest/inference --rev 49ca5bc98891463b140ca8cd11c27eaaa5c31b41 inference-cli
 opam pin add -y coq-wasm 'git+https://github.com/WasmCert/WasmCert-Coq.git#0fd83fa708922721132b6d6737179568d1f1d553'
 ./verify.sh
 ```
 
 The [script](verify.sh) runs `infc` on the spec and [the compiled contract](artifacts/locker.wasm), checks the generated proof with `coqc`, then runs `coqchk` on the compiled proof and its dependencies. The Wasm SHA-256 is `9f91b545f8bcdb1230263e2791f25b64f4a8445d6f44e0d96a3c6312b97f80b2`.
+
+## Verify two exports of the ICE Locker on Mainnet
+
+The [ICE specification](repro/ice/shelves.inf) is the entire input written for these two methods.
+
+```rust
+spec Locker {
+    commit_shelf requires auth(owner);
+    rearm_shelf requires auth(owner);
+}
+```
+
+With Stellar CLI installed, run the same compiler and public kernel on the deployed Wasm.
+
+```sh
+./repro/ice/verify.sh
+```
+
+The script fetches the contract code by hash, checks its SHA-256, and verifies both theorems in one generated module. For an offline run, pass a local copy of the same Wasm as the script's argument. The expected hash is `34b68322200c48b70645b06af1e49ac8d7137eea8d60c8b01345da5b30d411c8`.
+
+In this build both exports forward the owner and the position ID to one internal function. A third argument distinguishes the two operations. The proof resolves the helper in the instantiated module, tracks the original owner into the helper's parameter, and checks its call to the Soroban auth import. The two generated theorems are `obligation_1_proved` and `obligation_2_proved`.
 
 ## What the theorem says
 
@@ -28,7 +49,7 @@ The compiler resolves the owner parameter by name from Soroban XDR. WasmCert lin
 
 ```coq
 Theorem obligation_1_proved : obligation_1.
-Proof. unfold obligation_1. AuthSound.prove_requires_auth. Qed.
+Proof. exact (AuthCertificate.sound _ _ _ guard_1). Qed.
 ```
 
 Inspect the theorem in the generated module:
@@ -58,4 +79,4 @@ coqc target/changed/create_lock.v
 
 ## Inference integration
 
-The native prover can consume the checked theorem for the same Wasm and clause and report that result in its verification pipeline. The public fork currently produces a stand-alone Rocq proof. Its tactic handles function-only imports and the supported guarded prefix. An unsupported program shape can cause proof search to fail even when a contract is safe.
+The native prover can consume the checked theorem for the same Wasm and clause and report that result in its verification pipeline. The public fork currently produces a stand-alone Rocq proof. Its tactic handles function-only imports, a supported guarded prefix, and one internal forwarding call that passes locals or numeric constants. An unsupported program shape can cause proof search to fail even when a contract is safe.
