@@ -1,4 +1,41 @@
-# Prove owner authorization for a Soroban contract
+# Inference specifications for the ICE Locker
+
+## Voting-power math in Inference
+
+The [checkpoint model](repro/ice/math/model/checkpoints.inf) and [Locker bucket specification](repro/ice/math/locker/bucket.inf) contain eight native `forall` claims. **Their proof status is open.** The public compiler generates `ValidSpec` goals ending in `Admitted`. Running the generator or compiling its output does not discharge those goals.
+
+| Property from the earlier portfolio proof | What the Inference source expresses | Implementation under the claim |
+| --- | --- | --- |
+| Exact decay over an interval, including the boost plateau and expiry | Lost bonus seconds equal the overlap with the last 156 weeks. Splitting an interval at any intermediate time preserves that overlap. | Executable arithmetic model in `.inf` |
+| Same-week shortcut | For any week-aligned expiry and two timestamps in one week, a bucket decays for the entire interval or for zero seconds, as determined at the start. | Same model |
+| Checkpoint rounding | For any valid initial whole/remainder pair, two affordable normalized debits produce the same pair as a single combined debit. The remainder stays below the horizon. | Same model, with arbitrary loss and carry values |
+| Exact live bucket numerator | For every `u64` amount and ordered timestamp pair, both words equal the product of the amount and the capped multiplier. Splitting the principal at any amount preserves the full result, including the carry. At the Locker cap the whole portion fits in `u64`. | Mainnet Locker's compiled bucket function in a verification-only Wasm copy |
+
+The previous theorem quantified over a complete portfolio and an arbitrary-length checkpoint history. The new local composition laws capture a step one would use in an induction proof. The full history theorem, validity of stored head state, and equivalence of the public `total_supply` method to a full reprice remain open. The model covers ordinary locks with fixed principal. In a concrete run of the stock-compiled model, a one-unit lock just entering decay kept whole power 9 after two one-second steps. Dropping the first remainder gave 8.
+
+### Reproduce the compiler output
+
+With the pinned `infc` below, Stellar CLI, and `wasm-tools` (tested with 1.244.0), run:
+
+```sh
+./repro/ice/math/generate.sh
+```
+
+An optional argument supplies the original Wasm for offline use. The script checks the Mainnet SHA-256 and writes the verification copy and the generated goals into `target/ice-math/`. For the checkpoint model alone, stock Inference needs just:
+
+```sh
+infc repro/ice/math/model/checkpoints.inf --mode proof -v --out-dir target/model
+```
+
+### What worked on the stock compiler
+
+We ran upstream [`be016fc`](https://github.com/Inferara/inference/commit/be016fc05d2b8a1ff4377dd3a90dc148f99f3694) and the pinned fork on the model. They emitted byte-identical obligations. A stock spec quantifying an array with 64 scalar leaves compiled. With 65 leaves it failed with `P013`. Passing the Locker's 336 independently quantified amounts to a loop also failed at this limit. A scalar `u128` parameter failed type checking.
+
+The compiled bucket is internal function 156 of the pinned Locker. It takes a result pointer and writes two words. The script adds two scalar getters to a local copy so Inference can name each word. In the checked build all 361 original function bodies stayed byte-identical. The stock linker rejected this linked Soroban module because it owns static data. The fork's `--proof-subject` option generated three native obligations over the copy. The original module has neither getter export.
+
+The next integration test for the Inference team is to run these two generated modules with their [native discharger](https://github.com/Inferara/inference/blob/be016fc05d2b8a1ff4377dd3a90dc148f99f3694/core/wasm-to-v/ROCQ_CONTRACT.md). Useful product improvements for ICE would be a native unsigned 128-bit value, bindings for internal Rust arithmetic, and a way to specify an aggregate invariant and carry it over a history of contract calls.
+
+## Authorization example
 
 The public Rust method calls `owner.require_auth()`. The contract author writes one clause in [proof/create_lock.inf](proof/create_lock.inf) for the [existing Rust method](src/lib.rs).
 

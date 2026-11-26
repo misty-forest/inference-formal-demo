@@ -1,0 +1,44 @@
+// Two ABI views of the same 128-bit result from the Locker's bucket routine.
+external fn bucket_lo(amount: u64, expiry: u64, now: u64) -> u64;
+external fn bucket_hi(amount: u64, expiry: u64, now: u64) -> u64;
+use { bucket_lo, bucket_hi } from locker;
+const HORIZON: u64 = 94348800;
+const LIMB_MASK: u64 = 4294967295;
+
+spec OrdinaryBucket {
+    fn exact_numerator(amount: u64, expiry: u64, now: u64, remaining: u64) forall {
+        assume { assert(now <= expiry); }
+        let dt: u64 = expiry - now;
+        assume {
+            assert((dt <= HORIZON && remaining == dt) || (dt > HORIZON && remaining == HORIZON));
+        }
+        let factor: u64 = HORIZON + 9 * remaining;
+
+        // The factor fits in 30 bits. Both 32-bit partial products fit in u64.
+        let low_product: u64 = (amount & LIMB_MASK) * factor;
+        let high_product: u64 = (amount >> 32) * factor;
+        let carry: u64 = ((low_product >> 32) + (high_product & LIMB_MASK)) >> 32;
+        assert(bucket_hi(amount, expiry, now) == (high_product >> 32) + carry);
+        assert(bucket_lo(amount, expiry, now) == amount * factor);
+    }
+
+    // floor(N / HORIZON) fits u64 exactly when N < HORIZON * 2^64.
+    fn whole_power_fits_at_cap(amount: u64, expiry: u64, now: u64) forall {
+        assume { assert(amount <= 1000000000000000000 && now <= expiry); }
+        assert(bucket_hi(amount, expiry, now) < HORIZON);
+    }
+
+    fn split_principal_preserves_weight(total: u64, part: u64, expiry: u64, now: u64) forall {
+        assume { assert(part <= total && now <= expiry); }
+        let rest: u64 = total - part;
+        let left: u64 = bucket_lo(part, expiry, now);
+        let low_sum: u64 = left + bucket_lo(rest, expiry, now);
+        let high_sum: u64 = bucket_hi(part, expiry, now) + bucket_hi(rest, expiry, now);
+        assert(bucket_lo(total, expiry, now) == low_sum);
+        if low_sum < left {
+            assert(bucket_hi(total, expiry, now) == high_sum + 1);
+        } else {
+            assert(bucket_hi(total, expiry, now) == high_sum);
+        }
+    }
+}
